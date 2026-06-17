@@ -1,5 +1,6 @@
 """Tests for the Jira attachments module."""
 
+import base64
 import os
 import tempfile
 from unittest.mock import MagicMock, mock_open, patch
@@ -9,7 +10,6 @@ import pytest
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.attachment_cache import AttachmentCache
 from mcp_atlassian.jira.attachments import AttachmentsMixin
-from mcp_atlassian.jira.upload_staging import UploadStagingStore
 
 # Test scenarios for AttachmentsMixin
 #
@@ -501,34 +501,6 @@ class TestAttachmentsMixin:
         assert "content" not in result["failed"][0]
 
 
-class TestUploadStagingStore:
-    """Tests for the upload staging session validation flow."""
-
-    @pytest.fixture
-    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
-        """Mirror the shared AttachmentsMixin fixture for tests in this class."""
-        attachments_mixin = jira_fetcher
-        attachments_mixin.jira = MagicMock()
-        attachments_mixin.jira._session = MagicMock()
-        return attachments_mixin
-
-    def test_store_requires_issued_session(self):
-        """Test staging rejects arbitrary caller-provided session ids."""
-        store = UploadStagingStore(ttl_minutes=30, max_size_mb=1)
-
-        with pytest.raises(PermissionError, match="invalid or expired"):
-            store.store("unknown-session", "test.txt", b"data", "text/plain")
-
-    def test_store_accepts_server_issued_session(self):
-        """Test staging accepts sessions created by create_session."""
-        store = UploadStagingStore(ttl_minutes=30, max_size_mb=1)
-        session_id = store.create_session()
-
-        file_id = store.store(session_id, "test.txt", b"data", "text/plain")
-
-        assert store.get(session_id, file_id) is not None
-
-
 class TestAttachmentCacheDownloadTokens:
     """Tests for short-lived attachment download tokens."""
 
@@ -881,3 +853,136 @@ class TestAttachmentCacheDownloadTokens:
         # Assertions
         assert result["success"] is False
         assert "No issue key provided" in result["error"]
+
+
+class TestUploadAttachmentFromContent:
+    """Tests for upload_attachment_from_content (base64 content upload)."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        """Mirror the shared AttachmentsMixin fixture for tests in this class."""
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.jira._session = MagicMock()
+        return attachments_mixin
+
+    def test_upload_attachment_from_content_success(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test successful upload from base64-encoded content."""
+        content = b"test file content"
+        content_b64 = base64.b64encode(content).decode()
+        mock_response = [{"id": "att-001", "filename": "test.txt", "size": 17}]
+        attachments_mixin.jira.add_attachment_object.return_value = mock_response
+
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "test.txt", content_b64
+        )
+
+        assert result["success"] is True
+        assert result["issue_key"] == "TEST-123"
+        assert result["filename"] == "test.txt"
+        assert result["size"] == len(content)
+        assert result["id"] == "att-001"
+
+        # Verify the BytesIO object passed to the API
+        call_args = attachments_mixin.jira.add_attachment_object.call_args
+        assert call_args[0][0] == "TEST-123"
+        bio = call_args[0][1]
+        assert bio.name == "test.txt"
+        assert bio.read() == content
+
+    def test_upload_attachment_from_content_invalid_base64(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with invalid base64 content."""
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "test.txt", "not-valid-base64!!!"
+        )
+
+        assert result["success"] is False
+        assert "Invalid base64" in result["error"]
+
+    def test_upload_attachment_from_content_no_issue_key(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with empty issue key."""
+        content_b64 = base64.b64encode(b"content").decode()
+        result = attachments_mixin.upload_attachment_from_content(
+            "", "test.txt", content_b64
+        )
+
+        assert result["success"] is False
+        assert "No issue key provided" in result["error"]
+
+    def test_upload_attachment_from_content_no_filename(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with empty filename."""
+        content_b64 = base64.b64encode(b"content").decode()
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "", content_b64
+        )
+
+        assert result["success"] is False
+        assert "No filename provided" in result["error"]
+
+    def test_upload_attachment_from_content_no_content(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with empty content."""
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "test.txt", ""
+        )
+
+        assert result["success"] is False
+        assert "No content provided" in result["error"]
+
+    def test_upload_attachment_from_content_size_limit(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload exceeding size limit."""
+        from mcp_atlassian.jira import attachments as att_module
+
+        original_limit = att_module.MAX_ATTACHMENT_CONTENT_SIZE
+        try:
+            att_module.MAX_ATTACHMENT_CONTENT_SIZE = 10  # 10 bytes
+            content_b64 = base64.b64encode(b"x" * 20).decode()
+            result = attachments_mixin.upload_attachment_from_content(
+                "TEST-123", "test.txt", content_b64
+            )
+
+            assert result["success"] is False
+            assert "too large" in result["error"]
+        finally:
+            att_module.MAX_ATTACHMENT_CONTENT_SIZE = original_limit
+
+    def test_upload_attachment_from_content_api_error(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload when Jira API raises an exception."""
+        content_b64 = base64.b64encode(b"content").decode()
+        attachments_mixin.jira.add_attachment_object.side_effect = Exception(
+            "API connection failed"
+        )
+
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "test.txt", content_b64
+        )
+
+        assert result["success"] is False
+        assert "API connection failed" in result["error"]
+
+    def test_upload_attachment_from_content_no_response(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload when API returns falsy response."""
+        content_b64 = base64.b64encode(b"content").decode()
+        attachments_mixin.jira.add_attachment_object.return_value = None
+
+        result = attachments_mixin.upload_attachment_from_content(
+            "TEST-123", "test.txt", content_b64
+        )
+
+        assert result["success"] is False
+        assert "Failed to upload" in result["error"]

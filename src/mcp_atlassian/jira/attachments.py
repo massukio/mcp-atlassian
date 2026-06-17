@@ -1,5 +1,7 @@
 """Attachment operations for Jira API."""
 
+import base64
+import binascii
 import io
 import logging
 import os
@@ -14,6 +16,9 @@ from .protocols import AttachmentsOperationsProto
 
 # Configure logging
 logger = logging.getLogger("mcp-jira")
+
+# Maximum decoded file size for base64 content uploads (50 MB)
+MAX_ATTACHMENT_CONTENT_SIZE = 50 * 1024 * 1024
 
 
 class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
@@ -364,70 +369,100 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             logger.error(f"Error uploading attachment: {error_msg}")
             return {"success": False, "error": error_msg}
 
-    def upload_attachment_from_bytes(
-        self,
-        issue_key: str,
-        filename: str,
-        content: bytes,
-        mime_type: str = "application/octet-stream",
+    def upload_attachment_from_content(
+        self, issue_key: str, filename: str, content_base64: str
     ) -> dict[str, Any]:
-        """Upload attachment content directly from bytes to a Jira issue.
+        """
+        Upload an attachment to a Jira issue from base64-encoded content.
 
-        Used by the jira_upload_attachment MCP tool, which receives file content
-        from the staging store after the client POSTed files to /upload.
+        This method is designed for remote MCP deployments (e.g., Docker) where
+        the server cannot access client-side file paths.
 
         Args:
-            issue_key: The Jira issue key (e.g., 'PROJ-123').
-            filename: Display name for the attachment in Jira.
-            content: Raw file bytes.
-            mime_type: MIME type (used as the content-type in the multipart upload).
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            filename: The desired filename for the attachment
+            content_base64: Base64-encoded file content
 
         Returns:
-            A dictionary with upload result information.
+            A dictionary with upload result information
         """
         if not issue_key:
+            logger.error("No issue key provided for attachment upload")
             return {"success": False, "error": "No issue key provided"}
+
         if not filename:
+            logger.error("No filename provided for attachment upload")
             return {"success": False, "error": "No filename provided"}
-        if not content:
-            return {"success": False, "error": "Empty file content"}
+
+        if not content_base64:
+            logger.error("No content provided for attachment upload")
+            return {"success": False, "error": "No content provided"}
 
         try:
+            try:
+                content_bytes = base64.b64decode(content_base64, validate=True)
+            except binascii.Error:
+                logger.error("Invalid base64-encoded content for attachment upload")
+                return {
+                    "success": False,
+                    "error": "Invalid base64-encoded content",
+                }
+
+            if len(content_bytes) > MAX_ATTACHMENT_CONTENT_SIZE:
+                size_mb = len(content_bytes) / (1024 * 1024)
+                limit_mb = MAX_ATTACHMENT_CONTENT_SIZE / (1024 * 1024)
+                logger.error(
+                    f"Attachment content too large: {size_mb:.1f} MB "
+                    f"(limit: {limit_mb:.0f} MB)"
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"Content too large: {size_mb:.1f} MB "
+                        f"exceeds {limit_mb:.0f} MB limit"
+                    ),
+                }
+
             logger.info(
-                "Uploading %d bytes as '%s' to issue %s",
-                len(content),
-                filename,
-                issue_key,
+                f"Uploading attachment {filename} ({len(content_bytes)} bytes) "
+                f"to issue {issue_key}"
             )
-            buf = io.BytesIO(content)
-            # Setting .name on the BytesIO causes requests to use it as the
-            # filename in the multipart form upload.
-            buf.name = filename
-            attachment = self.jira.add_attachment_object(issue_key, buf)
-            if attachment:
+
+            attachment_io = io.BytesIO(content_bytes)
+            attachment_io.name = filename
+
+            result = self.jira.add_attachment_object(issue_key, attachment_io)
+
+            if result:
+                # Jira REST API returns a list of attachment objects
+                if isinstance(result, list) and result:
+                    attachment_id = result[0].get("id")
+                elif isinstance(result, dict):
+                    attachment_id = result.get("id")
+                else:
+                    attachment_id = None
+
                 logger.info(
-                    "Successfully uploaded '%s' to %s (%d bytes)",
-                    filename,
-                    issue_key,
-                    len(content),
+                    f"Successfully uploaded attachment {filename} to {issue_key} "
+                    f"(size: {len(content_bytes)} bytes)"
                 )
                 return {
                     "success": True,
                     "issue_key": issue_key,
                     "filename": filename,
-                    "size": len(content),
-                    "id": attachment.get("id")
-                    if isinstance(attachment, dict)
-                    else None,
+                    "size": len(content_bytes),
+                    "id": attachment_id,
                 }
-            logger.error("Upload returned empty response for '%s'", filename)
-            return {
-                "success": False,
-                "error": f"Upload returned empty response for '{filename}'",
-            }
+            else:
+                logger.error(f"Failed to upload attachment {filename} to {issue_key}")
+                return {
+                    "success": False,
+                    "error": f"Failed to upload attachment {filename} to {issue_key}",
+                }
+
         except Exception as e:
             error_msg = str(e)
-            logger.error("Error uploading '%s': %s", filename, error_msg)
+            logger.error(f"Error uploading attachment from content: {error_msg}")
             return {"success": False, "error": error_msg}
 
     def upload_attachments(

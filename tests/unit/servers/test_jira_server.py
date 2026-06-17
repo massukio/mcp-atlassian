@@ -1,5 +1,6 @@
 """Unit tests for the Jira FastMCP server implementation."""
 
+import base64
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -106,6 +107,14 @@ def mock_jira_fetcher():
     updated_issue.to_simplified_dict.return_value = {"key": "TEST-321"}
     updated_issue.custom_fields = {"attachment_results": [{"file": "doc.txt"}]}
     mock_fetcher.update_issue.return_value = updated_issue
+
+    mock_fetcher.upload_attachment_from_content.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "filename": "test.txt",
+        "size": 12,
+        "id": "att-001",
+    }
 
     transition_issue = MagicMock()
     transition_issue.to_simplified_dict.return_value = {"key": "TEST-999"}
@@ -459,6 +468,7 @@ class DirectJiraToolCaller:
             transition_issue,
             update_issue,
             update_sprint,
+            upload_attachment,
         )
 
         # Create mock context
@@ -501,6 +511,7 @@ class DirectJiraToolCaller:
             "jira_transition_issue": transition_issue.fn,
             "jira_create_sprint": create_sprint.fn,
             "jira_update_sprint": update_sprint.fn,
+            "jira_upload_attachment": upload_attachment.fn,
         }
 
         if tool_name not in tools:
@@ -1863,3 +1874,19 @@ async def test_create_version_error_handling(jira_client, mock_jira_fetcher):
     data = json.loads(response.content[0].text)
     assert data["success"] is False
     mock_jira_fetcher.create_project_version.side_effect = None
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_tool(jira_client, mock_jira_fetcher):
+    """Test jira_upload_attachment uploads base64-encoded content."""
+    content_b64 = base64.b64encode(b"test content").decode()
+    response = await jira_client.call_tool(
+        "jira_upload_attachment",
+        {"issue_key": "TEST-123", "filename": "test.txt", "content": content_b64},
+    )
+    mock_jira_fetcher.upload_attachment_from_content.assert_called_once_with(
+        "TEST-123", "test.txt", content_b64
+    )
+    payload = json.loads(response.content[0].text)
+    assert payload["success"] is True
+    assert payload["filename"] == "test.txt"

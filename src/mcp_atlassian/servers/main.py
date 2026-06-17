@@ -25,7 +25,6 @@ from mcp_atlassian.confluence.config import ConfluenceConfig
 from mcp_atlassian.jira import JiraFetcher
 from mcp_atlassian.jira.attachment_cache import get_attachment_cache
 from mcp_atlassian.jira.config import JiraConfig
-from mcp_atlassian.jira.upload_staging import get_upload_staging
 from mcp_atlassian.utils.environment import get_available_services
 from mcp_atlassian.utils.io import (
     get_cli_bitbucket_read_only_flag,
@@ -62,107 +61,6 @@ logger.info(f"Metrics collection initialized for pod: {pod_name}")
 
 async def health_check() -> JSONResponse:
     return JSONResponse({"status": "ok"})
-
-
-async def upload_endpoint(request: Request) -> JSONResponse:
-    """Receive multipart file uploads and stage them for Jira attachment.
-
-    Expects:
-      - Header:  Mcp-Session-Id: <session_id>  (from construct_upload_endpoint)
-      - Body:    multipart/form-data with one or more file fields
-
-    Returns JSON:
-      {"uploaded": [{"filename": "...", "uri": "upload://sessions/…", "size": …}]}
-    """
-    from pathlib import Path
-
-    session_id = request.headers.get("mcp-session-id")
-    if not session_id:
-        return JSONResponse(
-            {"error": "Mcp-Session-Id header is required"},
-            status_code=400,
-        )
-
-    staging = get_upload_staging()
-    if not staging.is_valid_session(session_id):
-        return JSONResponse(
-            {
-                "error": (
-                    "Invalid or expired upload session. "
-                    "Call construct_upload_endpoint to create a new session."
-                )
-            },
-            status_code=403,
-        )
-
-    try:
-        form = await request.form()
-    except Exception as exc:
-        logger.error("Failed to parse upload form: %s", exc)
-        return JSONResponse({"error": "Invalid multipart form data"}, status_code=400)
-
-    uploaded = []
-    max_file_bytes = staging._max_size_bytes
-    for _field_name, file_field in form.multi_items():
-        if not hasattr(file_field, "filename") or not file_field.filename:
-            continue
-        # Prevent path traversal: keep only the basename
-        safe_name = Path(file_field.filename).name
-        if not safe_name:
-            continue
-        try:
-            # Stream-read in chunks and enforce size limit early to prevent
-            # memory exhaustion from oversized uploads.
-            chunks: list[bytes] = []
-            total_read = 0
-            chunk_size = 64 * 1024  # 64 KB
-            while True:
-                chunk = await file_field.read(chunk_size)
-                if not chunk:
-                    break
-                total_read += len(chunk)
-                if total_read > max_file_bytes:
-                    return JSONResponse(
-                        {
-                            "error": (
-                                f"File '{safe_name}' exceeds maximum allowed size "
-                                f"({max_file_bytes} bytes). Upload rejected."
-                            )
-                        },
-                        status_code=413,
-                    )
-                chunks.append(chunk)
-            content: bytes = b"".join(chunks)
-        except Exception as exc:
-            logger.error("Failed to read uploaded file '%s': %s", safe_name, exc)
-            continue
-        mime_type: str = (
-            getattr(file_field, "content_type", None) or "application/octet-stream"
-        )
-        try:
-            file_id = staging.store(session_id, safe_name, content, mime_type)
-        except PermissionError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=403)
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=413)
-        uri = staging.make_uri(session_id, file_id)
-        uploaded.append({"filename": safe_name, "uri": uri, "size": len(content)})
-
-    if not uploaded:
-        return JSONResponse(
-            {
-                "error": "No files found in request. Use multipart/form-data with file fields."
-            },
-            status_code=400,
-        )
-
-    logger.info(
-        "Staged %d file(s) for session %s: %s",
-        len(uploaded),
-        session_id,
-        [u["filename"] for u in uploaded],
-    )
-    return JSONResponse({"success": True, "uploaded": uploaded})
 
 
 async def download_endpoint(request: Request) -> Response:
@@ -697,8 +595,6 @@ class AtlassianMCP(FastMCP[MainAppContext]):
 
         # Add metrics endpoint
         app.router.routes.append(Route("/metrics", metrics_endpoint, methods=["GET"]))
-        # Add file upload endpoint (used by construct_upload_endpoint / jira_upload_attachment flow)
-        app.router.routes.append(Route("/upload", upload_endpoint, methods=["POST"]))
         # Add short-lived attachment download endpoint (used by construct_download_endpoint)
         app.router.routes.append(
             Route("/download/{token}", download_endpoint, methods=["GET"])

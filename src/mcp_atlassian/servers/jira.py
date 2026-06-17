@@ -14,7 +14,6 @@ from requests.exceptions import HTTPError
 from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.jira.attachment_cache import get_attachment_cache
 from mcp_atlassian.jira.constants import DEFAULT_READ_JIRA_FIELDS
-from mcp_atlassian.jira.upload_staging import get_upload_staging
 from mcp_atlassian.models.jira.common import JiraUser
 from mcp_atlassian.servers.dependencies import get_jira_fetcher
 from mcp_atlassian.utils.decorators import check_write_access
@@ -2041,89 +2040,6 @@ async def list_cached_attachments(ctx: Context) -> str:
 
 
 @jira_mcp.tool(tags={"jira", "utility"})
-async def construct_upload_endpoint(ctx: Context) -> str:
-    """Return the URL and session token needed to upload local files to the MCP server.
-
-    This is step 1 of the client-side file upload flow:
-
-    1. Call this tool to get upload_url + session_id.
-    2. POST your file(s) to upload_url using multipart/form-data with the
-       Mcp-Session-Id header set to session_id.
-
-       Windows PowerShell (handles paths with spaces):
-           curl.exe -X POST <upload_url> -H "Mcp-Session-Id: <id>" -F 'file=@"C:\\path with spaces\\file.pdf"'
-
-       Linux / macOS (handles paths with spaces):
-           curl -X POST <upload_url> -H "Mcp-Session-Id: <id>" -F "file=@'/path/with spaces/file.pdf'"
-
-       The server returns: {"uploaded": [{"filename": "...", "uri": "upload://...", "size": ...}]}
-
-    3. Pass the returned upload:// URIs to jira_upload_attachment.
-
-    Sessions expire after 30 minutes (configurable via UPLOAD_STAGING_TTL_MINUTES).
-    The base URL defaults to http://localhost:8932 and can be overridden by the
-    MCP_SERVER_BASE_URL environment variable.
-
-    Args:
-        ctx: The FastMCP context.
-
-    Returns:
-        JSON string with upload_url, session_id, required_headers, and OS-specific usage example.
-    """
-    import platform
-
-    staging = get_upload_staging()
-    session_id = staging.create_session()
-    base_url = _get_external_base_url()
-    upload_url = f"{base_url}/upload"
-
-    is_windows = platform.system() == "Windows"
-    curl_cmd = "curl.exe" if is_windows else "curl"
-
-    if is_windows:
-        # PowerShell: -s silences progress bar; outer single-quotes + inner double-quotes
-        # handles paths with spaces. e.g. -F 'file=@"C:\My Documents\report.pdf"'
-        curl_example = (
-            f'{curl_cmd} -s -X POST "{upload_url}"'
-            f' -H "Mcp-Session-Id: {session_id}"'
-            " -F 'file=@\"C:\\path with spaces\\your_file.pdf\"'"
-        )
-    else:
-        # bash/zsh: -s silences progress bar; outer double-quotes + inner single-quotes
-        # handles paths with spaces. e.g. -F "file=@'/home/user/my docs/report.pdf'"
-        curl_example = (
-            f'{curl_cmd} -s -X POST "{upload_url}"'
-            f' -H "Mcp-Session-Id: {session_id}"'
-            " -F \"file=@'/path/with spaces/your_file.pdf'\""
-        )
-
-    return json.dumps(
-        {
-            "upload_url": upload_url,
-            "session_id": session_id,
-            "required_headers": {"Mcp-Session-Id": session_id},
-            "curl_example": curl_example,
-            "instructions": (
-                "1. Replace the path placeholder in curl_example with your actual file path. "
-                "2. Run the curl command in a terminal. "
-                "3. The command will output JSON. A successful upload looks like: "
-                '{"success": true, "uploaded": [{"filename": "your_file.pdf", "uri": "upload://sessions/SESSION_ID/FILE_ID", "size": 12345}]}. '
-                "4. Copy the uri value(s) from the uploaded array. "
-                "5. Call jira_upload_attachment with issue_key and those uri value(s)."
-            ),
-            "path_with_spaces_note": (
-                "Windows PowerShell — outer single quotes, path in double quotes: "
-                "-F 'file=@\"C:\\My Docs\\file.pdf\"'  |  "
-                "Linux/macOS bash — path in single quotes inside double quotes: "
-                "-F \"file=@'/my docs/file.pdf'\""
-            ),
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
-
-
-@jira_mcp.tool(tags={"jira", "utility"})
 async def construct_download_endpoint(
     ctx: Context,
     issue_key: Annotated[
@@ -2196,113 +2112,49 @@ async def construct_download_endpoint(
 
 @jira_mcp.tool(tags={"jira", "write"})
 @check_write_access
-async def jira_upload_attachment(
+async def upload_attachment(
     ctx: Context,
-    issue_key: Annotated[
+    issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
+    filename: Annotated[
         str,
-        Field(description="Jira issue key to attach the file(s) to (e.g., 'PROJ-123')"),
+        Field(description="Desired filename for the attachment (e.g., 'report.pdf')"),
     ],
-    upload_uris: Annotated[
-        list[str],
+    content: Annotated[
+        str,
         Field(
             description=(
-                "List of upload:// URIs returned by the /upload endpoint after calling "
-                "construct_upload_endpoint and uploading your files. "
-                "Example: ['upload://sessions/abc123/xyz456']"
+                "Base64-encoded file content. Use this tool when the MCP server "
+                "runs remotely and cannot access client-side file paths."
             )
         ),
     ],
 ) -> str:
-    """Upload one or more staged files to a Jira issue as attachments.
+    """Upload a file attachment to a Jira issue using base64-encoded content.
 
-    This is step 3 of the client-side file upload flow (after construct_upload_endpoint
-    and POSTing files to /upload).
-
-    Each upload:// URI is resolved from the server-side staging store, then
-    uploaded directly to Jira via the REST API — no base64, no context-window
-    overhead.
-
-    Staged files are removed from the store after a successful upload.
-    Unused uploads expire automatically after 30 minutes.
+    This tool is designed for remote MCP deployments (e.g., Docker) where
+    the server cannot access client-side file paths. The client should read
+    the file locally, base64-encode the content, and pass it to this tool.
 
     Args:
         ctx: The FastMCP context.
-        issue_key: Jira issue key (e.g., 'PROJ-123').
-        upload_uris: List of upload:// URIs from the /upload endpoint response.
+        issue_key: Jira issue key.
+        filename: Desired filename for the attachment.
+        content: Base64-encoded file content.
 
     Returns:
-        JSON string with per-file upload results.
+        JSON string with upload result.
 
     Raises:
-        ValueError: If in read-only mode or Jira client is unavailable.
+        ValueError: If in read-only mode or Jira client unavailable.
     """
     jira = await get_jira_fetcher(ctx)
-    staging = get_upload_staging()
-
-    uploaded = []
-    failed = []
-
-    for uri in upload_uris:
-        parsed = staging.parse_uri(uri)
-        if not parsed:
-            failed.append(
-                {
-                    "uri": uri,
-                    "error": (
-                        "Invalid upload URI format. "
-                        "Expected upload://sessions/<session_id>/<file_id>"
-                    ),
-                }
-            )
-            continue
-
-        session_id, file_id = parsed
-        entry = staging.get(session_id, file_id)
-        if not entry:
-            failed.append(
-                {
-                    "uri": uri,
-                    "error": (
-                        "Staged file not found or expired. "
-                        "Call construct_upload_endpoint and re-upload the file."
-                    ),
-                }
-            )
-            continue
-
-        result = jira.upload_attachment_from_bytes(
-            issue_key=issue_key,
-            filename=entry["filename"],
-            content=entry["content"],
-            mime_type=entry["mime_type"],
+    try:
+        result = jira.upload_attachment_from_content(issue_key, filename, content)
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(
+            f"Error uploading attachment to {issue_key}: {str(e)}", exc_info=True
         )
-
-        if result.get("success"):
-            staging.remove(session_id, file_id)
-            uploaded.append(
-                {
-                    "filename": result["filename"],
-                    "size": result["size"],
-                    "id": result.get("id"),
-                }
-            )
-        else:
-            failed.append(
-                {
-                    "uri": uri,
-                    "filename": entry["filename"],
-                    "error": result.get("error"),
-                }
-            )
-
-    return json.dumps(
-        {
-            "success": len(failed) == 0,
-            "issue_key": issue_key,
-            "total": len(upload_uris),
-            "uploaded": uploaded,
-            "failed": failed,
-        },
-        indent=2,
-        ensure_ascii=False,
-    )
+        return json.dumps(
+            {"success": False, "error": str(e)}, indent=2, ensure_ascii=False
+        )

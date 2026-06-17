@@ -11,7 +11,6 @@ from mcp_atlassian.servers.main import (
     UserTokenMiddleware,
     download_endpoint,
     main_mcp,
-    upload_endpoint,
 )
 
 
@@ -95,24 +94,6 @@ async def test_streamable_http_app_health_check_endpoint():
         response = await client.get("/healthz")
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
-
-
-@pytest.mark.anyio
-async def test_upload_endpoint_rejects_invalid_session():
-    """Test the upload endpoint rejects session ids that were not issued by the server."""
-    request = MagicMock(spec=Request)
-    request.headers = {"mcp-session-id": "invalid-session"}
-    request.form = AsyncMock()
-
-    staging = MagicMock()
-    staging.is_valid_session.return_value = False
-
-    with patch("mcp_atlassian.servers.main.get_upload_staging", return_value=staging):
-        response = await upload_endpoint(request)
-
-    assert response.status_code == 403
-    assert b"Invalid or expired upload session" in response.body
-    request.form.assert_not_awaited()
 
 
 @pytest.mark.anyio
